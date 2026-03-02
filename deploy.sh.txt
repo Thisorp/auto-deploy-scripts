@@ -1,0 +1,523 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+############################################
+# Deploy Menu Script
+# - Run on a fresh VM: provides menu to clone/pull/compose/status/logs
+############################################
+
+# Default branch (edit if needed)
+BRANCH="main"  # <-- đổi branch tại đây nếu cần
+
+CONF_FILE="${HOME}/.deploy_menu.conf"
+LOG_TAIL_DEFAULT=200
+HEALTH_TIMEOUT_DEFAULT=120
+
+############################################
+# Helpers
+############################################
+info(){ echo -e "\n[INFO] $*"; }
+warn(){ echo -e "\n[WARN] $*" >&2; }
+err(){  echo -e "\n[ERROR] $*" >&2; }
+pause(){ read -rp $'\nNhấn Enter để tiếp tục...'; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || { err "Thiếu command: $1"; return 1; }; }
+
+mask_url() { sed -E 's#(https?://)[^/@]+@#\1***@#g'; }
+
+detect_compose() {
+  if docker compose version >/dev/null 2>&1; then
+    echo "docker compose"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    echo "docker-compose"
+  else
+    echo ""
+  fi
+}
+
+load_conf() {
+  if [ -f "$CONF_FILE" ]; then
+    # shellcheck disable=SC1090
+    source "$CONF_FILE"
+  fi
+  : "${APP_DIR:=}"
+  : "${REPO_URL:=}"
+  : "${COMPOSE_PATH:=}"
+}
+
+save_conf() {
+  # Lưu an toàn: escape dấu \ trong giá trị để tránh lỗi source
+  local app_dir_esc repo_url_esc compose_path_esc
+  app_dir_esc=${APP_DIR//\\/\\\\}
+  repo_url_esc=${REPO_URL//\\/\\\\}
+  compose_path_esc=${COMPOSE_PATH//\\/\\\\}
+
+  cat >"$CONF_FILE" <<EOF
+# Deploy menu config
+APP_DIR="${app_dir_esc}"
+REPO_URL="${repo_url_esc}"
+COMPOSE_PATH="${compose_path_esc}"
+EOF
+  info "Đã lưu cấu hình vào: $CONF_FILE"
+}
+
+ensure_compose_path() {
+  # Không hỏi lại nếu đã có COMPOSE_PATH hợp lệ
+  if [ -n "${COMPOSE_PATH:-}" ] && [ -f "${COMPOSE_PATH}" ]; then
+    return 0
+  fi
+
+  # Nếu chưa có hoặc sai, hỏi 1 lần rồi lưu config
+  warn "COMPOSE_PATH chưa được set hoặc file không tồn tại."
+  read -rp "Nhập path tới docker-compose.yml (vd: /opt/myapp/docker-compose.yml): " COMPOSE_PATH
+  [ -f "${COMPOSE_PATH}" ] || { err "Không tìm thấy compose file: ${COMPOSE_PATH}"; return 1; }
+
+  save_conf
+  return 0
+}
+
+ensure_prereqs() {
+  info "Kiểm tra prerequisites..."
+  need_cmd git || return 1
+  need_cmd docker || return 1
+  DC="$(detect_compose)"
+  if [ -z "${DC}" ]; then
+    err "Không tìm thấy docker compose (docker compose hoặc docker-compose)."
+    return 1
+  fi
+  info "OK: git, docker, compose = '${DC}'"
+  return 0
+}
+
+prompt_repo_dir() {
+  if [ -n "${APP_DIR}" ] && [ -d "${APP_DIR}" ]; then
+    read -rp "Repo directory [${APP_DIR}]: " x
+    if [ -n "$x" ]; then APP_DIR="$x"; fi
+  else
+    read -rp "Nhập repo directory (vd: /opt/myapp): " APP_DIR
+  fi
+}
+
+prompt_repo_url() {
+  if [ -n "${REPO_URL}" ]; then
+    read -rp "Repo URL [${REPO_URL}]: " x
+    if [ -n "$x" ]; then REPO_URL="$x"; fi
+  else
+    read -rp "Nhập repo URL (HTTPS hoặc SSH): " REPO_URL
+  fi
+}
+
+prompt_compose_path() {
+  if [ -n "${COMPOSE_PATH}" ] && [ -f "${COMPOSE_PATH}" ]; then
+    read -rp "docker-compose.yml path [${COMPOSE_PATH}]: " x
+    if [ -n "$x" ]; then COMPOSE_PATH="$x"; fi
+  else
+    read -rp "Nhập path tới docker-compose.yml (vd: /opt/myapp/docker-compose.yml): " COMPOSE_PATH
+  fi
+}
+
+is_git_repo() {
+  [ -d "${APP_DIR}/.git" ] && git -C "$APP_DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+get_remote_url() {
+  git -C "$APP_DIR" remote get-url origin 2>/dev/null || true
+}
+
+need_git_creds_if_https() {
+  local remote_url="$1"
+  if [[ "$remote_url" =~ ^https?:// ]]; then
+    read -rp "Git username: " GIT_USER
+    read -rsp "Git password/token: " GIT_PASS
+    echo ""
+    export GIT_USER GIT_PASS
+  else
+    export GIT_USER="" GIT_PASS=""
+  fi
+}
+
+auth_url_for_https() {
+  # input: https://host/path/repo.git
+  # output: https://user:pass@host/path/repo.git
+  local url="$1"
+  local user="$2"
+  local pass="$3"
+  echo "$url" | sed -E "s#^(https?://)#\\1${user}:${pass}@#"
+}
+
+############################################
+# Actions
+############################################
+action_set_config() {
+  load_conf
+  prompt_repo_dir
+  prompt_repo_url
+  prompt_compose_path
+  [ -f "${COMPOSE_PATH}" ] || { err "Compose file không tồn tại: ${COMPOSE_PATH}"; pause; return; }
+  save_conf
+  pause
+}
+
+action_clone_repo() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+
+  prompt_repo_dir
+  prompt_repo_url
+
+  # Nếu thư mục đã tồn tại và không rỗng -> KHÔNG clone vào để tránh lỗi
+  if [ -d "$APP_DIR" ] && [ "$(ls -A "$APP_DIR" 2>/dev/null | wc -l | tr -d ' ')" != "0" ]; then
+    err "Thư mục ${APP_DIR} đã tồn tại và không rỗng. Không thể git clone vào đây."
+    warn "Gợi ý: chọn một thư mục trống khác, hoặc xóa/move dữ liệu cũ trước."
+    pause
+    return
+  fi
+
+  mkdir -p "$APP_DIR"
+  info "Cloning..."
+  info "Repo URL: $(echo "$REPO_URL" | mask_url)"
+  git clone "$REPO_URL" "$APP_DIR"
+
+  # set branch
+  info "Checkout branch: $BRANCH"
+  git -C "$APP_DIR" checkout "$BRANCH" >/dev/null 2>&1 || true
+
+  # default compose path if empty
+  if [ -z "${COMPOSE_PATH}" ]; then
+    COMPOSE_PATH="${APP_DIR}/docker-compose.yml"
+  fi
+
+  save_conf
+  info "Clone xong. Current commit: $(git -C "$APP_DIR" rev-parse --short HEAD)"
+  pause
+}
+
+action_pull_code() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+
+  prompt_repo_dir
+  is_git_repo || { err "Không thấy git repo tại: $APP_DIR (hãy chọn Clone trước)."; pause; return; }
+
+  local remote_url
+  remote_url="$(get_remote_url)"
+  if [ -z "$remote_url" ]; then
+    err "Không lấy được remote origin URL."
+    pause; return
+  fi
+
+  info "Remote: $(echo "$remote_url" | mask_url)"
+  info "Pull branch: $BRANCH"
+
+  need_git_creds_if_https "$remote_url"
+
+  if [[ "$remote_url" =~ ^https?:// ]]; then
+    local auth_url
+    auth_url="$(auth_url_for_https "$remote_url" "$GIT_USER" "$GIT_PASS")"
+    git -C "$APP_DIR" fetch "$auth_url" "$BRANCH"
+    git -C "$APP_DIR" checkout "$BRANCH"
+    git -C "$APP_DIR" reset --hard FETCH_HEAD
+  else
+    git -C "$APP_DIR" fetch origin "$BRANCH"
+    git -C "$APP_DIR" checkout "$BRANCH"
+    git -C "$APP_DIR" reset --hard "origin/${BRANCH}"
+  fi
+
+  info "Updated. Current commit: $(git -C "$APP_DIR" rev-parse --short HEAD)"
+  pause
+}
+
+action_compose_up() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+  ensure_compose_path || { pause; return; }
+
+  info "Compose file: $COMPOSE_PATH"
+  info "Chạy docker compose up -d (không pull images)..."
+  $DC -f "$COMPOSE_PATH" up -d --remove-orphans
+
+  info "DONE: compose up"
+  pause
+}
+
+action_compose_up_one_service() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+  ensure_compose_path || { pause; return; }
+
+  info "Danh sách services:"
+  $DC -f "$COMPOSE_PATH" config --services
+
+  read -rp "Nhập service name cần up: " svc
+  if [ -z "$svc" ]; then
+    warn "Service name không được để trống."
+    pause
+    return
+  fi
+
+  info "Chạy docker compose up -d cho service: $svc (không pull images)..."
+  $DC -f "$COMPOSE_PATH" up -d --remove-orphans "$svc"
+
+  info "DONE: compose up $svc"
+  pause
+}
+
+action_status() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+  ensure_compose_path || { pause; return; }
+
+  info "=== docker compose ps ==="
+  $DC -f "$COMPOSE_PATH" ps
+
+  mapfile -t CIDS < <($DC -f "$COMPOSE_PATH" ps -q)
+  if [ "${#CIDS[@]}" -eq 0 ]; then
+    warn "Không thấy container nào thuộc compose stack."
+    pause; return
+  fi
+
+  info "=== State/Health ==="
+  printf "%-45s | %-10s | %-15s\n" "CONTAINER" "STATE" "HEALTH"
+  printf -- "------------------------------------------------------------------------------------------\n"
+  for cid in "${CIDS[@]}"; do
+    name="$(docker inspect -f '{{.Name}}' "$cid" | sed 's#^/##')"
+    state="$(docker inspect -f '{{.State.Status}}' "$cid")"
+    health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$cid")"
+    printf "%-45s | %-10s | %-15s\n" "$name" "$state" "$health"
+  done
+
+  pause
+}
+
+action_wait_health() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+  ensure_compose_path || { pause; return; }
+
+  read -rp "Health timeout seconds [${HEALTH_TIMEOUT_DEFAULT}]: " t
+  local timeout="${t:-$HEALTH_TIMEOUT_DEFAULT}"
+
+  mapfile -t CIDS < <($DC -f "$COMPOSE_PATH" ps -q)
+  if [ "${#CIDS[@]}" -eq 0 ]; then
+    warn "Không thấy container nào thuộc compose stack."
+    pause; return
+  fi
+
+  info "Chờ container running/healthy (max ${timeout}s)..."
+  local start_ts now_ts all_ok state health
+  start_ts=$(date +%s)
+
+  while true; do
+    all_ok=true
+    for cid in "${CIDS[@]}"; do
+      state="$(docker inspect -f '{{.State.Status}}' "$cid")"
+      health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$cid")"
+      [ "$state" = "running" ] || all_ok=false
+      if [ "$health" != "no-healthcheck" ] && [ "$health" != "healthy" ]; then
+        all_ok=false
+      fi
+    done
+
+    if $all_ok; then
+      info "OK: Tất cả container running (và healthy nếu có healthcheck)."
+      break
+    fi
+
+    now_ts=$(date +%s)
+    if (( now_ts - start_ts > timeout )); then
+      warn "Timeout. Hãy xem Status/Logs để debug."
+      break
+    fi
+
+    sleep 3
+  done
+
+  pause
+}
+
+action_logs() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+  ensure_compose_path || { pause; return; }
+
+  read -rp "Tail lines [${LOG_TAIL_DEFAULT}]: " t
+  local tail="${t:-$LOG_TAIL_DEFAULT}"
+
+  echo ""
+  echo "1) Logs tất cả services (tail)"
+  echo "2) Logs follow (-f) tất cả services"
+  echo "3) Logs 1 service (tail)"
+  echo "4) Logs 1 service (follow)"
+  read -rp "Chọn: " mode
+
+  case "$mode" in
+    1) $DC -f "$COMPOSE_PATH" logs --tail "$tail" ;;
+    2) $DC -f "$COMPOSE_PATH" logs -f --tail "$tail" ;;
+    3)
+      $DC -f "$COMPOSE_PATH" config --services
+      read -rp "Nhập service name: " svc
+      $DC -f "$COMPOSE_PATH" logs --tail "$tail" "$svc"
+      ;;
+    4)
+      $DC -f "$COMPOSE_PATH" config --services
+      read -rp "Nhập service name: " svc
+      $DC -f "$COMPOSE_PATH" logs -f --tail "$tail" "$svc"
+      ;;
+    *) warn "Lựa chọn không hợp lệ." ;;
+  esac
+
+  pause
+}
+
+action_full_deploy() {
+  # Full deploy: pull code -> compose up -> wait -> status/logs (KHÔNG docker pull)
+  load_conf
+  ensure_prereqs || { pause; return; }
+
+  prompt_repo_dir
+  ensure_compose_path || { pause; return; }
+
+  if ! is_git_repo; then
+    err "Repo chưa được clone. Hãy chọn Clone trước."
+    pause; return
+  fi
+
+  local remote_url
+  remote_url="$(get_remote_url)"
+  [ -n "$remote_url" ] || { err "Không lấy được remote origin URL."; pause; return; }
+
+  info "Step 1/4: Pull code ($BRANCH)"
+  need_git_creds_if_https "$remote_url"
+  if [[ "$remote_url" =~ ^https?:// ]]; then
+    local auth_url
+    auth_url="$(auth_url_for_https "$remote_url" "$GIT_USER" "$GIT_PASS")"
+    git -C "$APP_DIR" fetch "$auth_url" "$BRANCH"
+    git -C "$APP_DIR" checkout "$BRANCH"
+    git -C "$APP_DIR" reset --hard FETCH_HEAD
+  else
+    git -C "$APP_DIR" fetch origin "$BRANCH"
+    git -C "$APP_DIR" checkout "$BRANCH"
+    git -C "$APP_DIR" reset --hard "origin/${BRANCH}"
+  fi
+  info "Commit: $(git -C "$APP_DIR" rev-parse --short HEAD)"
+
+  info "Step 2/4: docker compose up -d (không pull images)"
+  $DC -f "$COMPOSE_PATH" up -d --remove-orphans
+
+  info "Step 3/4: wait health"
+  local timeout="${HEALTH_TIMEOUT_DEFAULT}"
+  mapfile -t CIDS < <($DC -f "$COMPOSE_PATH" ps -q)
+  if [ "${#CIDS[@]}" -gt 0 ]; then
+    local start_ts now_ts all_ok state health
+    start_ts=$(date +%s)
+    while true; do
+      all_ok=true
+      for cid in "${CIDS[@]}"; do
+        state="$(docker inspect -f '{{.State.Status}}' "$cid")"
+        health="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "$cid")"
+        [ "$state" = "running" ] || all_ok=false
+        if [ "$health" != "no-healthcheck" ] && [ "$health" != "healthy" ]; then
+          all_ok=false
+        fi
+      done
+      $all_ok && break
+      now_ts=$(date +%s)
+      (( now_ts - start_ts > timeout )) && { warn "Timeout healthcheck."; break; }
+      sleep 3
+    done
+  fi
+
+  info "Step 4/4: status + logs tail"
+  $DC -f "$COMPOSE_PATH" ps
+  $DC -f "$COMPOSE_PATH" logs --tail "$LOG_TAIL_DEFAULT"
+
+  pause
+}
+
+action_restart_service() {
+  load_conf
+  ensure_prereqs || { pause; return; }
+  ensure_compose_path || { pause; return; }
+
+  echo ""
+  echo "1) Restart ALL services"
+  echo "2) Restart 1 service"
+  read -rp "Chọn: " mode
+
+  case "$mode" in
+    1)
+      info "Restart toàn bộ services..."
+      $DC -f "$COMPOSE_PATH" restart
+      ;;
+    2)
+      info "Danh sách services:"
+      $DC -f "$COMPOSE_PATH" config --services
+      read -rp "Nhập service name: " svc
+      if [ -z "$svc" ]; then
+        warn "Service name không được để trống."
+      else
+        info "Restart service: $svc"
+        $DC -f "$COMPOSE_PATH" restart "$svc"
+      fi
+      ;;
+    *)
+      warn "Lựa chọn không hợp lệ."
+      ;;
+  esac
+
+  pause
+}
+
+############################################
+# Menu
+############################################
+print_header() {
+  clear || true
+  echo "=============================================="
+  echo " Deploy Menu (VM quick setup)"
+  echo " Branch default: ${BRANCH}"
+  echo " Config file    : ${CONF_FILE}"
+  echo "=============================================="
+  load_conf
+  echo " APP_DIR       : ${APP_DIR:-<not set>}"
+  echo " REPO_URL      : ${REPO_URL:-<not set>}"
+  echo " COMPOSE_PATH  : ${COMPOSE_PATH:-<not set>}"
+  echo "----------------------------------------------"
+}
+
+main_loop() {
+  while true; do
+    print_header
+    echo "1) Set/Update config (repo dir, repo url, compose path)"
+    echo "2) Clone code (first time)"
+    echo "3) Pull code (update)"
+    echo "4) Docker compose: up -d (all services)"
+    echo "5) Docker compose: up -d (one service)"
+    echo "6) Check status (ps + health)"
+    echo "7) Wait health (optional)"
+    echo "8) View logs"
+    echo "9) Full deploy (pull code -> compose up -> wait -> status/logs)"
+    echo "10) Restart service (all hoặc 1 service)"
+    echo "0) Exit"
+    echo ""
+    read -rp "Chọn: " choice
+
+    case "$choice" in
+      1) action_set_config ;;
+      2) action_clone_repo ;;
+      3) action_pull_code ;;
+      4) action_compose_up ;;
+      5) action_compose_up_one_service ;;
+      6) action_status ;;
+      7) action_wait_health ;;
+      8) action_logs ;;
+      9) action_full_deploy ;;
+      10) action_restart_service ;;
+      0) info "Bye!"; exit 0 ;;
+      *) warn "Lựa chọn không hợp lệ."; pause ;;
+    esac
+  done
+}
+
+main_loop
+
